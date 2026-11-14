@@ -10,12 +10,17 @@ A terminal tool for archiving complete web pages (HTML, CSS, JavaScript, images,
 
 ## Features
 
-- Downloads HTML, CSS, JavaScript, images, and other assets
-- Rewrites links to local references so pages work offline
+- Saves the **exact original bytes** of every resource (binary-safe Buffers — images and fonts are never corrupted by string concatenation)
+- Names each resource uniquely by its **final URL** (after redirects); the full URL including query string is hashed, so `/logo.png?size=small` and `/logo.png?size=large` never overwrite each other
+- Follows redirects and always resolves relative references (CSS `url()`, `srcset`, …) against the **final** URL
+- Rewrites references to stable relative paths across HTML attributes, `srcset`/`imagesrcset`, inline `<style>`, `style=""` attributes, and CSS `url()`/`@import`
+- Shared and cyclic resources (e.g. circular CSS `@import`) are fetched **once**; a two-level in-flight/final-URL cache de-duplicates concurrent and redirect-aliased requests
+- Failed downloads keep their original **absolute URL** so the reference still resolves online; cross-origin URLs and connection hints (`preconnect`, `dns-prefetch`) are left untouched
+- Plain navigation links (`<a href>`, `rel="canonical"`, …) are not treated as resources
+- Cancellable via `AbortSignal` (Ctrl-C / SIGTERM), tearing in-flight requests down cleanly
 - Optional conversion to Markdown
 - Configurable depth for following links
 - `robots.txt` modes: obey, warn, or ignore
-- Follows redirects automatically
 - Respects `crawl-delay` directives
 - Programmatic API for use as a Node.js module
 
@@ -83,6 +88,27 @@ const downloader = new WebDownloader({
 });
 
 downloader.download('https://example.com');
+```
+
+Cancellation is supported through an `AbortSignal`:
+
+```javascript
+const controller = new AbortController();
+const downloader = new WebDownloader({ outputDir: './out', signal: controller.signal });
+// Later: controller.abort() rejects the run with an AbortError and tears
+// down every in-flight request.
+```
+
+## Testing
+
+The suite runs fully offline against an HTTP fixture that binds **only to
+`127.0.0.1`** (it never listens on an external interface). It asserts exact
+on-disk byte digests, rewritten references, per-route request counts
+(shared/cyclic/redirected resources hit once), failed-URL and redirect
+behaviour, deterministic re-runs, and cancellation.
+
+```bash
+npm test
 ```
 
 ## When to use what

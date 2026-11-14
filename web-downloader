@@ -4,19 +4,37 @@
  * Web Page Downloader - A terminal tool for downloading complete web pages
  *
  * Features:
- * - Downloads HTML, CSS, JavaScript, images, and other assets
- * - Converts links to local references for offline viewing
- * - Supports multiple output formats
- * - Optional conversion to markdown
- * - Customizable depth for following links
- * - robots.txt compliance checking
+ * - Downloads HTML, CSS, JavaScript, images, fonts and other assets
+ * - Saves the exact original bytes of every resource (binary safe)
+ * - Names resources uniquely by their FINAL URL (after redirects), so URLs
+ *   differing only in query string never overwrite each other
+ * - Rewrites references (HTML attrs, srcset, <style>, style="" and CSS url())
+ *   to stable relative paths; failed downloads keep their absolute URL
+ * - Follows redirects and always resolves relative references against the
+ *   final URL
+ * - Shared / cyclic resources (e.g. CSS @import loops) are fetched once
+ * - Cancellable via AbortSignal; in-flight requests are torn down cleanly
+ * - Optional conversion to markdown, link following and robots.txt support
  */
 
 const https = require('https');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { URL } = require('url');
+
+const MAX_REDIRECTS = 10;
+const ASSET_DIR = 'assets';
+
+// Error thrown when a download (or the whole run) is cancelled.
+class AbortError extends Error {
+  constructor(message = 'Download aborted') {
+    super(message);
+    this.name = 'AbortError';
+    this.code = 'ABORT_ERR';
+  }
+}
 
 class RobotsTxtParser {
   constructor(robotsTxt, userAgent = '*') {
@@ -50,11 +68,7 @@ class RobotsTxtParser {
       if (key.toLowerCase() === 'user-agent') {
         // Check if this section applies to our user agent
         relevantSection = value === this.userAgent || value === '*';
-        if (value === '*') {
-          generalSection = true;
-        } else {
-          generalSection = false;
-        }
+        generalSection = value === '*';
         continue;
       }
 
@@ -126,6 +140,146 @@ class RobotsTxtParser {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Small, index-preserving HTML scanning helpers (no external dependencies)
+// ---------------------------------------------------------------------------
+
+const TAG_RE = /<!--[\s\S]*?-->|<!DOCTYPE[^>]*>|<([a-zA-Z][a-zA-Z0-9-]*)((?:\s+[^<>]*?)?)\s*(\/?)>/g;
+const ATTR_RE = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)(\s*=\s*("[^"]*"|'[^']*'|[^\s>]+))?/g;
+const STYLE_TAG_RE = /<style\b[^>]*>([\s\S]*?)<\/style>/gi;
+
+/**
+ * Scan every HTML tag and return the tag name plus each attribute's raw
+ * value and the exact index span of that value inside the document.
+ */
+function scanTags(html) {
+  const tags = [];
+  let m;
+  TAG_RE.lastIndex = 0;
+  while ((m = TAG_RE.exec(html)) !== null) {
+    if (!m[1]) continue; // comment / doctype
+    const name = m[1].toLowerCase();
+    const tagStart = m.index;
+    const tagEnd = TAG_RE.lastIndex;
+    const attrText = m[2] || '';
+    const attrs = [];
+    let am;
+    ATTR_RE.lastIndex = 0;
+    while ((am = ATTR_RE.exec(attrText)) !== null) {
+      const attrName = am[1].toLowerCase();
+      if (am[3] === undefined) {
+        attrs.push({ name: attrName, value: null, valueStart: null, valueEnd: null, quote: null });
+        continue;
+      }
+      const raw = am[3];
+      const quoted = raw.startsWith('"') || raw.startsWith("'");
+      const quote = quoted ? raw[0] : null;
+      const value = quoted ? raw.slice(1, -1) : raw;
+      // Map the value position from attrText-relative coordinates into the
+      // full document: tag start + where attrs begin + match offset.
+      const attrBaseOffset = m[0].indexOf(attrText);
+      const rawStartInAttr = am.index + am[0].length - raw.length;
+      const absStart = tagStart + attrBaseOffset + rawStartInAttr + (quoted ? 1 : 0);
+      attrs.push({
+        name: attrName,
+        value,
+        valueStart: absStart,
+        valueEnd: absStart + value.length,
+        quote
+      });
+    }
+    tags.push({ name, start: tagStart, end: tagEnd, attrs });
+  }
+  return tags;
+}
+
+function findBaseHref(html) {
+  const tags = scanTags(html);
+  for (const tag of tags) {
+    if (tag.name !== 'base') continue;
+    const href = tag.attrs.find(a => a.name === 'href');
+    if (href && href.value) return href.value;
+  }
+  return null;
+}
+
+/** Apply non-overlapping edits (sorted by start) by string slicing. */
+function applyEdits(text, edits) {
+  const sorted = edits.slice().sort((a, b) => a.start - b.start);
+  let out = '';
+  let cursor = 0;
+  for (const e of sorted) {
+    if (e.start < cursor) continue; // defensive: skip overlap
+    out += text.slice(cursor, e.start) + e.replacement;
+    cursor = e.end;
+  }
+  return out + text.slice(cursor);
+}
+
+// Matches both `@import "..."` / `@import url(...)` and plain `url(...)`.
+// Branch A (groups 1-3): a quoted string — group 1 is the optional @import
+// prefix, group 2 the quote, group 3 the URL.
+// Branch B (groups 4-6): url(...) — group 4 the optional @import prefix,
+// group 5 is `url(` plus optional whitespace/quote, group 6 the URL.
+const CSS_URL_RE = /(@import\s+)?(["'])(.*?)\2|(@import\s+)?url\(\s*(["']?)([^)'"]*)\5\s*\)/gi;
+
+/**
+ * Rewrite every url()/@import reference in a CSS text.
+ *
+ * `resolve(ref, isCss)` returns the local relative path to write, the
+ * absolute URL on failure, or null to leave the reference untouched.
+ * The url()/@import wrapper and its quoting style are preserved.
+ *
+ * `preferSingleQuote` is used inside HTML style="" attributes, where an
+ * inner double quote would collide with the attribute's own delimiter.
+ */
+async function rewriteCss(cssText, resolve, preferSingleQuote = false) {
+  const jobs = [];
+  let m;
+  CSS_URL_RE.lastIndex = 0;
+  while ((m = CSS_URL_RE.exec(cssText)) !== null) {
+    let isImport;
+    let wrapper;
+    let ref;
+    if (m[3] !== undefined) {
+      // Branch A: quoted string (only valid after @import)
+      if (!m[1]) continue;
+      isImport = true;
+      wrapper = m[2];
+      ref = m[3];
+    } else {
+      // Branch B: url(...)
+      isImport = Boolean(m[4]);
+      wrapper = 'url(';
+      ref = m[6];
+    }
+    ref = ref.trim();
+    if (!ref) continue;
+    jobs.push({ match: m, ref, isImport, wrapper });
+  }
+
+  const edits = [];
+  for (const job of jobs) {
+    if (/^(data|javascript|mailto|tel|#)/i.test(job.ref)) continue;
+    const replacement = await resolve(job.ref, job.isImport);
+    if (replacement === null || replacement === undefined) continue;
+    const q = preferSingleQuote ? "'" : '"';
+    let rebuilt;
+    if (job.wrapper.startsWith('url(')) {
+      // Preserve the @import prefix when the original was `@import url(...)`.
+      rebuilt = (job.isImport ? '@import ' : '') + `url(${q}${replacement}${q})`;
+    } else {
+      rebuilt = `@import ${job.wrapper}${replacement}${job.wrapper}`;
+    }
+    edits.push({ start: job.match.index, end: job.match.index + job.match[0].length, replacement: rebuilt });
+  }
+  return applyEdits(cssText, edits);
+}
+
+// ---------------------------------------------------------------------------
+// Downloader
+// ---------------------------------------------------------------------------
+
 class WebDownloader {
   constructor(options = {}) {
     this.options = {
@@ -137,13 +291,169 @@ class WebDownloader {
       timeout: options.timeout || 30000,
       markdown: options.markdown || false,
       robotsTxt: options.robotsTxt || 'ignore', // 'obey', 'ignore', 'warn'
+      signal: options.signal || undefined,
       ...options
     };
-    this.downloaded = new Set();
-    this.queue = [];
-    this.robotsParsers = new Map(); // Cache robots.txt per domain
-    this.lastCrawlTime = new Map(); // Track last crawl time per domain for crawl-delay
+    this.downloaded = new Set();          // page URLs already processed
+    this.robotsParsers = new Map();       // Cache robots.txt per domain
+    this.lastCrawlTime = new Map();       // crawl-delay bookkeeping per domain
+    this.assets = new Map();              // final URL -> asset record
+    this.assetAliases = new Map();        // attempted URL -> record (covers redirects & failures)
+    this.knownFinalUrls = new Map();      // final URL -> in-flight/resolved fetch promise
+    this.inFlight = new Map();            // attempted URL -> fetch promise
+    this.activeRequests = 0;              // currently open HTTP requests
   }
+
+  throwIfAborted() {
+    if (this.options.signal && this.options.signal.aborted) {
+      throw new AbortError();
+    }
+  }
+
+  // ----- Low level fetch -----------------------------------------------------
+
+  /**
+   * Perform ONE HTTP request, following redirects, and return the raw bytes.
+   * Always resolves against the FINAL URL. Binary safe: the body is a Buffer.
+   */
+  fetchResource(url, redirectsRemaining = MAX_REDIRECTS) {
+    this.throwIfAborted();
+    const signal = this.options.signal;
+    const parsedUrl = new URL(url);
+    const protocol = parsedUrl.protocol === 'https:' ? https : http;
+
+    this.activeRequests++;
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let req;
+
+      const cleanup = () => {
+        this.activeRequests = Math.max(0, this.activeRequests - 1);
+        if (signal && signal.removeEventListener) {
+          signal.removeEventListener('abort', onAbort);
+        }
+      };
+
+      const fail = (err) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        try { req.destroy(); } catch (e) { /* ignore */ }
+        reject(err);
+      };
+
+      const onAbort = () => fail(new AbortError(`Request aborted: ${url}`));
+
+      const reqOptions = {
+        headers: {
+          'User-Agent': this.options.userAgent,
+          'Accept': '*/*',
+          'Accept-Language': 'en-US,en;q=0.5',
+        },
+        timeout: this.options.timeout
+      };
+
+      try {
+        req = protocol.get(url, reqOptions, (response) => {
+          // Redirects: resolve Location against the CURRENT url and hand the
+          // next hop back to the caller (fetchOnce), which owns de-duplication.
+          if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+            if (settled) return;
+            response.resume(); // drain, no body needed
+            response.on('end', () => {
+              if (settled) return;
+              if (redirectsRemaining <= 0) {
+                settled = true;
+                cleanup();
+                return reject(new Error('Too many redirects'));
+              }
+              const redirectUrl = new URL(response.headers.location, url).href;
+              console.log(`Redirecting: ${url} -> ${redirectUrl}`);
+              settled = true;
+              cleanup();
+              resolve({ redirect: true, url: redirectUrl });
+            });
+            response.on('error', fail);
+            return;
+          }
+
+          if (response.statusCode !== 200) {
+            response.resume();
+            return fail(new Error(`HTTP ${response.statusCode} for ${url}`));
+          }
+
+          const chunks = [];
+          response.on('data', (chunk) => chunks.push(chunk));
+          response.on('end', () => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            resolve({
+              redirect: false,
+              url, // final URL: the last hop after all redirects
+              statusCode: response.statusCode,
+              headers: response.headers,
+              body: Buffer.concat(chunks)
+            });
+          });
+          response.on('error', fail);
+        });
+      } catch (err) {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        return reject(err);
+      }
+
+      req.on('error', fail);
+      // The `timeout` request option fires this event after inactivity; the
+      // socket isn't destroyed automatically, so fail() destroys it.
+      req.on('timeout', () => fail(new Error(`Request timed out: ${url}`)));
+
+      if (signal) {
+        if (signal.aborted) return onAbort();
+        if (signal.addEventListener) signal.addEventListener('abort', onAbort, { once: true });
+        else if (signal.on) signal.once('abort', onAbort);
+      }
+    });
+  }
+
+  /**
+   * Fetch a URL, following redirects, with two levels of de-duplication:
+   *   - inFlight: identical attempted URLs share one in-flight promise
+   *   - knownFinalUrls: if any hop lands on a URL already being fetched (or
+   *     already resolved, e.g. via a different redirect chain), reuse it
+   * Returns a response whose `url` is the FINAL url after all redirects.
+   */
+  fetchOnce(initialUrl) {
+    const drive = (url, hopsLeft) => {
+      if (this.knownFinalUrls.has(url)) return this.knownFinalUrls.get(url);
+
+      const hop = this.fetchResource(url, hopsLeft);
+      this.knownFinalUrls.set(url, hop);
+      return hop.then((res) => {
+        if (res.redirect) {
+          // This hop never produced a body; its entry should point at the
+          // chain's eventual result rather than a redirect marker.
+          const next = drive(res.url, hopsLeft - 1);
+          this.knownFinalUrls.set(url, next);
+          return next;
+        }
+        return res;
+      }, (err) => {
+        this.knownFinalUrls.delete(url);
+        throw err;
+      });
+    };
+
+    if (this.inFlight.has(initialUrl)) return this.inFlight.get(initialUrl);
+    const promise = drive(initialUrl, MAX_REDIRECTS)
+      .finally(() => this.inFlight.delete(initialUrl));
+    this.inFlight.set(initialUrl, promise);
+    return promise;
+  }
+
+  // ----- robots.txt ----------------------------------------------------------
 
   async getRobotsParser(origin) {
     if (this.robotsParsers.has(origin)) {
@@ -153,7 +463,8 @@ class WebDownloader {
     try {
       const robotsUrl = `${origin}/robots.txt`;
       console.log(`Fetching robots.txt from: ${robotsUrl}`);
-      const robotsTxt = await this.fetchPage(robotsUrl);
+      const res = await this.fetchOnce(robotsUrl);
+      const robotsTxt = res.body.toString('utf8');
       const parser = new RobotsTxtParser(robotsTxt, this.options.userAgent);
       this.robotsParsers.set(origin, parser);
       return parser;
@@ -197,7 +508,16 @@ class WebDownloader {
       if (timeSinceLastCrawl < requiredDelay) {
         const waitTime = requiredDelay - timeSinceLastCrawl;
         console.log(`⏱️  Crawl-delay: waiting ${waitTime}ms before downloading from ${origin}`);
-        await new Promise(resolve => setTimeout(resolve, waitTime));
+        await new Promise((resolve, reject) => {
+          const t = setTimeout(resolve, waitTime);
+          const signal = this.options.signal;
+          if (signal) {
+            const onAbort = () => { clearTimeout(t); reject(new AbortError()); };
+            if (signal.aborted) return onAbort();
+            if (signal.addEventListener) signal.addEventListener('abort', onAbort, { once: true });
+            else signal.once('abort', onAbort);
+          }
+        });
       }
 
       this.lastCrawlTime.set(origin, Date.now());
@@ -206,176 +526,414 @@ class WebDownloader {
     return true;
   }
 
-  async download(url, depth = 0) {
+  // ----- Naming --------------------------------------------------------------
+
+  /**
+   * Build a unique, deterministic file name for a resource from its FINAL url.
+   * The full URL (including query string) is hashed, so two resources whose
+   * paths look identical but whose query strings differ never collide.
+   */
+  getAssetName(finalUrl, contentType) {
+    const parsed = new URL(finalUrl);
+    const hash = crypto.createHash('sha1').update(finalUrl).digest('hex').slice(0, 20);
+    let ext = path.extname(parsed.pathname);
+    if (!ext || ext.length > 10) {
+      ext = this.extensionForContentType(contentType, parsed.pathname);
+    }
+    return `${ASSET_DIR}/${hash}${ext}`;
+  }
+
+  extensionForContentType(contentType, pathname) {
+    const ct = (contentType || '').split(';')[0].trim().toLowerCase();
+    const map = {
+      'text/css': '.css',
+      'text/html': '.html',
+      'text/javascript': '.js',
+      'application/javascript': '.js',
+      'application/x-javascript': '.js',
+      'image/png': '.png',
+      'image/jpeg': '.jpg',
+      'image/gif': '.gif',
+      'image/svg+xml': '.svg',
+      'image/webp': '.webp',
+      'image/x-icon': '.ico',
+      'font/woff': '.woff',
+      'font/woff2': '.woff2',
+      'application/font-woff': '.woff',
+      'application/font-woff2': '.woff2',
+      'application/vnd.ms-fontobject': '.eot',
+      'font/ttf': '.ttf',
+      'font/otf': '.otf',
+      'application/json': '.json',
+      'application/xml': '.xml',
+      'text/plain': '.txt'
+    };
+    if (map[ct]) return map[ct];
+    if (ct.startsWith('image/')) return '.' + ct.slice(6).replace(/[^a-z0-9]/g, '');
+    if (ct.startsWith('font/')) return '.' + ct.slice(5).replace(/[^a-z0-9]/g, '');
+    return path.extname(pathname) || '.bin';
+  }
+
+  isCss(record) {
+    const ct = (record.contentType || '').split(';')[0].trim().toLowerCase();
+    if (ct.includes('css')) return true;
+    return record.name.endsWith('.css');
+  }
+
+  /** Relative path from the directory of `from` to the saved asset. */
+  relativeRef(from, assetName) {
+    const fromDir = path.dirname(from);
+    let rel = path.relative(fromDir, assetName).split(path.sep).join('/');
+    if (!rel.startsWith('.')) rel = './' + rel;
+    return rel;
+  }
+
+  // ----- Asset graph ---------------------------------------------------------
+
+  /**
+   * Download a referenced resource (once per attempted URL, once stored per
+   * final URL) and return its record. Shared resources and redirect chains
+   * resolve to a single stored file. Failures are also remembered (so a
+   * broken URL referenced from many places is hit only once) and produce a
+   * record whose `failed` flag keeps the absolute URL.
+   */
+  async downloadAsset(attemptedUrl) {
+    // Cache lookup BEFORE any network activity: the same URL referenced from
+    // both HTML and CSS must never trigger a second request.
+    if (this.assetAliases.has(attemptedUrl)) {
+      return this.assetAliases.get(attemptedUrl);
+    }
+
+    let res;
     try {
-      const parsedUrl = new URL(url);
-
-      if (this.downloaded.has(url) || depth > this.options.maxDepth) {
-        return;
-      }
-
-      // Check robots.txt before downloading
-      const allowed = await this.checkRobotsTxt(url);
-      if (!allowed) {
-        return;
-      }
-
-      this.downloaded.add(url);
-      console.log(`Downloading: ${url}`);
-
-      const html = await this.fetchPage(url);
-
-      if (!html) {
-        console.error(`Failed to download: ${url}`);
-        return;
-      }
-
-      // Save the HTML
-      const filename = this.getFilename(parsedUrl);
-      const filepath = path.join(this.options.outputDir, filename);
-
-      // Create directory if it doesn't exist
-      const dir = path.dirname(filepath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
-
-      let processedHtml = html;
-
-      if (this.options.includeAssets) {
-        processedHtml = await this.downloadAssets(html, parsedUrl);
-      }
-
-      if (this.options.markdown) {
-        const markdown = this.convertToMarkdown(processedHtml);
-        fs.writeFileSync(filepath.replace('.html', '.md'), markdown);
-      } else {
-        fs.writeFileSync(filepath, processedHtml);
-      }
-
-      console.log(`Saved: ${filepath}`);
-
-      // Follow links if enabled
-      if (this.options.followLinks && depth < this.options.maxDepth) {
-        const links = this.extractLinks(html, parsedUrl);
-        for (const link of links) {
-          await this.download(link, depth + 1);
-        }
-      }
-
-    } catch (error) {
-      console.error(`Error downloading ${url}:`, error.message);
-    }
-  }
-
-  fetchPage(url) {
-    return new Promise((resolve, reject) => {
-      const parsedUrl = new URL(url);
-      const protocol = parsedUrl.protocol === 'https:' ? https : http;
-
-      const options = {
-        headers: {
-          'User-Agent': this.options.userAgent,
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.5',
-        },
-        timeout: this.options.timeout
+      res = await this.fetchOnce(attemptedUrl);
+    } catch (err) {
+      if (err.name === 'AbortError') throw err;
+      console.error(`Failed to download asset: ${attemptedUrl} (${err.message})`);
+      const failedRecord = {
+        name: null, failed: true, originalUrl: attemptedUrl, finalUrl: attemptedUrl
       };
+      this.assetAliases.set(attemptedUrl, failedRecord);
+      return failedRecord;
+    }
 
-      protocol.get(url, options, (response) => {
-        // Handle redirects
-        if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-          const redirectUrl = new URL(response.headers.location, url).href;
-          console.log(`Redirecting to: ${redirectUrl}`);
-          return resolve(this.fetchPage(redirectUrl));
-        }
+    const finalUrl = res.url;
+    // The attempted URL may have redirected to a resource already stored.
+    if (this.assets.has(finalUrl)) {
+      const existing = this.assets.get(finalUrl);
+      this.assetAliases.set(attemptedUrl, existing);
+      return existing;
+    }
 
-        if (response.statusCode !== 200) {
-          return reject(new Error(`HTTP ${response.statusCode}`));
-        }
-
-        let data = '';
-        response.on('data', chunk => data += chunk);
-        response.on('end', () => resolve(data));
-      }).on('error', reject);
-    });
+    const contentType = res.headers['content-type'] || '';
+    const name = this.getAssetName(finalUrl, contentType);
+    const record = {
+      name,
+      failed: false,
+      originalUrl: attemptedUrl,
+      finalUrl,
+      contentType,
+      bytes: res.body,           // exact original bytes
+      processed: false,
+      cssProcessed: false
+    };
+    this.assets.set(finalUrl, record);
+    this.assetAliases.set(attemptedUrl, record);
+    console.log(`Downloaded asset: ${name} <- ${finalUrl}`);
+    return record;
   }
 
-  async downloadAssets(html, baseUrl) {
-    const assetRegex = /(href|src)=["']([^"']+)["']/g;
-    let match;
-    const assets = [];
+  /**
+   * Resolve a raw reference found in an HTML or CSS document.
+   * Returns:
+   *   - local relative path on success
+   *   - the absolute URL when the resource fails (reference stays absolute)
+   *   - null when the reference must be left completely untouched
+   *     (different origin / non-http scheme / unparseable)
+   */
+  async resolveReference(rawRef, baseUrl, documentPath, isCssImport) {
+    let absolute;
+    try {
+      absolute = new URL(rawRef, baseUrl).href;
+    } catch (e) {
+      return null;
+    }
+    const parsed = new URL(absolute);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+    if (parsed.origin !== new URL(baseUrl).origin) return null;
 
-    while ((match = assetRegex.exec(html)) !== null) {
-      const assetUrl = match[2];
-      if (!assetUrl.startsWith('data:') && !assetUrl.startsWith('javascript:')) {
-        try {
-          const fullUrl = new URL(assetUrl, baseUrl).href;
-          if (fullUrl.startsWith(baseUrl.origin)) {
-            assets.push({ original: assetUrl, full: fullUrl });
+    const record = await this.downloadAsset(absolute);
+    if (record.failed) return absolute; // keep original absolute URL
+
+    if (isCssImport || this.isCss(record)) {
+      await this.processCss(record, documentPath);
+    }
+    return this.relativeRef(documentPath, record.name);
+  }
+
+  /**
+   * Rewrite url()/@import inside a downloaded CSS file. Cyclic @import graphs
+   * terminate because a record is marked visited before recursing; every CSS
+   * file on the server is therefore requested at most once.
+   */
+  async processCss(record, documentPath) {
+    if (record.cssProcessed) return;
+    record.cssProcessed = true; // mark first -> cycle safe
+
+    const cssText = record.bytes.toString('utf8');
+    const rewritten = await rewriteCss(cssText, (ref, isImport) =>
+      this.resolveReference(ref, record.finalUrl, documentPath, isImport)
+    );
+    record.bytes = Buffer.from(rewritten, 'utf8');
+  }
+
+  /** Persist every downloaded asset (CSS rewritten, everything else raw). */
+  flushAssets() {
+    for (const record of this.assets.values()) {
+      if (record.failed || record.processed) continue;
+      const filepath = path.join(this.options.outputDir, record.name);
+      fs.mkdirSync(path.dirname(filepath), { recursive: true });
+      fs.writeFileSync(filepath, record.bytes); // exact bytes (or rewritten CSS)
+      record.processed = true;
+    }
+  }
+
+  // ----- HTML processing -----------------------------------------------------
+
+  async processHtml(html, baseUrl, documentPath) {
+    this.throwIfAborted();
+
+    // <base href> changes every relative resolution in the document.
+    const baseHref = findBaseHref(html);
+    if (baseHref) {
+      try { baseUrl = new URL(baseHref, baseUrl).href; } catch (e) { /* keep old base */ }
+    }
+
+    const tags = scanTags(html);
+    const edits = [];
+
+    // valueStart/valueEnd cover the unquoted value only (quotes excluded),
+    // so replacements are written bare and the original quotes survive.
+    const replaceAttribute = (attr, replacement) => {
+      if (attr.value === null || attr.valueStart === null) return;
+      edits.push({ start: attr.valueStart, end: attr.valueEnd, replacement });
+    };
+
+    const parseSrcset = (value) =>
+      value.split(',').map(part => {
+        const trimmed = part.trim();
+        const sp = trimmed.split(/\s+/);
+        return { token: sp[0], descriptor: sp.slice(1).join(' '), raw: trimmed };
+      }).filter(x => x.token);
+
+    const rewriteSrcset = async (attr) => {
+      if (attr.value === null || !attr.value.trim()) return;
+      const entries = parseSrcset(attr.value);
+      const out = [];
+      for (const entry of entries) {
+        const local = await this.resolveReference(entry.token, baseUrl, documentPath, false);
+        if (local === null || local === undefined) {
+          out.push(entry.raw);
+        } else {
+          out.push(local + (entry.descriptor ? ' ' + entry.descriptor : ''));
+        }
+      }
+      replaceAttribute(attr, out.join(', '));
+    };
+
+    for (const tag of tags) {
+      // <style> blocks are handled separately below.
+      if (tag.name === 'style' || tag.name === 'base') continue;
+
+      if (tag.name === 'img' || tag.name === 'source') {
+        for (const attr of tag.attrs) {
+          if (attr.name === 'src' || attr.name === 'data-src') {
+            const local = await this.resolveReference(attr.value, baseUrl, documentPath, false);
+            if (local !== null) replaceAttribute(attr, local);
+          } else if (attr.name === 'srcset' || attr.name === 'data-srcset') {
+            await rewriteSrcset(attr);
           }
-        } catch (e) {
-          // Invalid URL, skip
         }
+        continue;
+      }
+
+      if (tag.name === 'script') {
+        const src = tag.attrs.find(a => a.name === 'src');
+        if (src && src.value) {
+          const local = await this.resolveReference(src.value, baseUrl, documentPath, false);
+          if (local !== null) replaceAttribute(src, local);
+        }
+        continue;
+      }
+
+      if (tag.name === 'link') {
+        const relAttr = tag.attrs.find(a => a.name === 'rel');
+        const rel = relAttr ? relAttr.value.toLowerCase() : '';
+        const href = tag.attrs.find(a => a.name === 'href');
+        if (!href || !href.value) continue;
+
+        // Plain hyperlinks (<link rel="canonical"/"alternate"/"author"/...) and
+        // connection hints (preconnect/dns-prefetch) are NOT resources and must
+        // stay untouched.
+        const resourceRels = ['stylesheet', 'icon', 'shortcut icon', 'apple-touch-icon',
+          'preload', 'prefetch', 'manifest', 'modulepreload'];
+        const hintRels = ['preconnect', 'dns-prefetch', 'prerender'];
+        if (hintRels.includes(rel)) continue;
+        const asAttr = tag.attrs.find(a => a.name === 'as');
+        const isResource = resourceRels.includes(rel) ||
+          (asAttr && asAttr.value && asAttr.value.toLowerCase() !== 'document');
+        if (!isResource) continue;
+
+        const isStylesheet = rel.includes('stylesheet') ||
+          (asAttr && asAttr.value && asAttr.value.toLowerCase() === 'style');
+
+        const imagesrcset = tag.attrs.find(a => a.name === 'imagesrcset');
+        if (imagesrcset) {
+          await rewriteSrcset(imagesrcset);
+        } else {
+          const local = await this.resolveReference(href.value, baseUrl, documentPath, isStylesheet);
+          if (local !== null) replaceAttribute(href, local);
+        }
+        continue;
+      }
+
+      if (tag.name === 'video' || tag.name === 'audio' || tag.name === 'track' ||
+          tag.name === 'embed' || tag.name === 'iframe' || tag.name === 'object') {
+        const src = tag.attrs.find(a => a.name === 'src');
+        if (src && src.value) {
+          const local = await this.resolveReference(src.value, baseUrl, documentPath, false);
+          if (local !== null) replaceAttribute(src, local);
+        }
+        const data = tag.attrs.find(a => a.name === 'data');
+        if (data && data.value) {
+          const local = await this.resolveReference(data.value, baseUrl, documentPath, false);
+          if (local !== null) replaceAttribute(data, local);
+        }
+        continue;
+      }
+
+      // style="background: url(...)" on any element
+      const styleAttr = tag.attrs.find(a => a.name === 'style');
+      if (styleAttr && styleAttr.value && /url\(|@import/i.test(styleAttr.value)) {
+        const rewritten = await rewriteCss(styleAttr.value, (ref, isImport) =>
+          this.resolveReference(ref, baseUrl, documentPath, isImport), true);
+        replaceAttribute(styleAttr, rewritten);
       }
     }
 
-    // Download each asset
-    for (const asset of assets) {
-      try {
-        const content = await this.fetchPage(asset.full);
-        const filename = this.getFilename(new URL(asset.full));
-        const filepath = path.join(this.options.outputDir, filename);
-
-        const dir = path.dirname(filepath);
-        if (!fs.existsSync(dir)) {
-          fs.mkdirSync(dir, { recursive: true });
-        }
-
-        fs.writeFileSync(filepath, content);
-        console.log(`Downloaded asset: ${filename}`);
-
-        // Update HTML to reference local file
-        html = html.replace(asset.original, filename);
-      } catch (e) {
-        console.error(`Failed to download asset: ${asset.full}`, e.message);
-      }
+    // Inline <style> blocks.
+    let sm;
+    STYLE_TAG_RE.lastIndex = 0;
+    while ((sm = STYLE_TAG_RE.exec(html)) !== null) {
+      const block = sm[1];
+      if (!/url\(|@import/i.test(block)) continue;
+      const rewritten = await rewriteCss(block, (ref, isImport) =>
+        this.resolveReference(ref, baseUrl, documentPath, isImport)
+      );
+      edits.push({
+        start: sm.index + sm[0].indexOf(block),
+        end: sm.index + sm[0].indexOf(block) + block.length,
+        replacement: rewritten
+      });
     }
 
-    return html;
+    return applyEdits(html, edits);
+  }
+
+  // ----- Pages ---------------------------------------------------------------
+
+  getPagePath(finalUrl) {
+    const parsed = new URL(finalUrl);
+    let pathname = decodeURIComponent(parsed.pathname);
+    let tail = path.basename(pathname);
+    if (tail === '' || pathname.endsWith('/')) {
+      tail = 'index.html';
+    } else if (!path.extname(tail)) {
+      tail = tail + '.html';
+    }
+    const dir = path.dirname(pathname).replace(/^\/+/, '');
+    let result = path.join(dir || '.', tail);
+    if (parsed.search) {
+      const queryHash = crypto.createHash('sha1').update(parsed.search).digest('hex').slice(0, 8);
+      const ext = path.extname(result);
+      result = path.join(path.dirname(result), path.basename(result, ext) + '_' + queryHash + ext);
+    }
+    return result.split(path.sep).join('/');
+  }
+
+  writeOutputFile(relativePath, content) {
+    const filepath = path.join(this.options.outputDir, relativePath);
+    fs.mkdirSync(path.dirname(filepath), { recursive: true });
+    fs.writeFileSync(filepath, content);
+    return filepath;
+  }
+
+  async download(url, depth = 0) {
+    this.throwIfAborted();
+    const normalized = new URL(url).href;
+
+    if (this.downloaded.has(normalized) || depth > this.options.maxDepth) {
+      return;
+    }
+
+    const allowed = await this.checkRobotsTxt(normalized);
+    if (!allowed) return;
+
+    this.downloaded.add(normalized);
+    console.log(`Downloading: ${normalized}`);
+
+    // Final URL matters: redirects change the base for relative resolution.
+    const res = await this.fetchOnce(normalized);
+    const finalUrl = res.url;
+    const html = res.body.toString('utf8');
+    const pagePath = this.getPagePath(finalUrl);
+
+    let processedHtml = html;
+    if (this.options.includeAssets) {
+      processedHtml = await this.processHtml(html, finalUrl, pagePath);
+    }
+
+    // Everything referenced (including CSS sub-resources) is now resolved.
+    this.flushAssets();
+
+    let filepath;
+    if (this.options.markdown) {
+      const markdown = this.convertToMarkdown(processedHtml);
+      filepath = this.writeOutputFile(pagePath.replace(/\.html?$/, '.md'), markdown);
+    } else {
+      filepath = this.writeOutputFile(pagePath, processedHtml);
+    }
+    console.log(`Saved: ${filepath}`);
+
+    // Follow <a> links only (assets are handled by the asset graph).
+    if (this.options.followLinks && depth < this.options.maxDepth) {
+      const links = this.extractLinks(processedHtml, finalUrl);
+      for (const link of links) {
+        await this.download(link, depth + 1);
+      }
+    }
   }
 
   extractLinks(html, baseUrl) {
-    const linkRegex = /href=["']([^"']+)["']/g;
     const links = new Set();
-    let match;
-
-    while ((match = linkRegex.exec(html)) !== null) {
-      const link = match[1];
-      if (!link.startsWith('#') && !link.startsWith('javascript:') && !link.startsWith('mailto:')) {
-        try {
-          const fullUrl = new URL(link, baseUrl).href;
-          if (fullUrl.startsWith(baseUrl.origin)) {
-            links.add(fullUrl);
-          }
-        } catch (e) {
-          // Invalid URL, skip
+    const baseOrigin = new URL(baseUrl).origin;
+    for (const tag of scanTags(html)) {
+      if (tag.name !== 'a') continue;
+      const href = tag.attrs.find(a => a.name === 'href');
+      if (!href || !href.value) continue;
+      const link = href.value;
+      if (link.startsWith('#') || /^(javascript|mailto|tel|data):/i.test(link)) continue;
+      try {
+        const fullUrl = new URL(link, baseUrl);
+        if (fullUrl.origin === baseOrigin &&
+            (fullUrl.protocol === 'http:' || fullUrl.protocol === 'https:')) {
+          links.add(fullUrl.href);
         }
+      } catch (e) {
+        // Invalid URL, skip
       }
     }
-
     return Array.from(links);
-  }
-
-  getFilename(url) {
-    let pathname = url.pathname;
-    if (pathname === '/' || pathname === '') {
-      return 'index.html';
-    }
-    if (!path.extname(pathname)) {
-      pathname += '/index.html';
-    }
-    return pathname.replace(/^\//, '');
   }
 
   convertToMarkdown(html) {
@@ -479,7 +1037,7 @@ USAGE:
 OPTIONS:
   -h, --help              Show this help message
   -o, --output <dir>      Output directory (default: ./downloaded-site)
-  --no-assets             Don't download CSS, JS, images, etc.
+  --no-assets             Don't download CSS, JS, images, fonts, etc.
   -f, --follow-links      Follow and download linked pages
   -d, --depth <n>         Maximum depth for following links (default: 1)
   -m, --markdown          Convert HTML to Markdown
@@ -525,23 +1083,46 @@ async function main() {
   console.log('Web Page Downloader');
   console.log('===================\n');
 
+  const controller = new AbortController();
+  options.signal = controller.signal;
+  const onCancel = () => {
+    console.error('\n⚠️  Cancellation requested, aborting...');
+    controller.abort();
+  };
+  process.on('SIGINT', onCancel);
+  process.on('SIGTERM', onCancel);
+
   const downloader = new WebDownloader(options);
 
-  for (const url of options.urls) {
-    try {
+  try {
+    for (const url of options.urls) {
       console.log(`\nStarting download: ${url}`);
       await downloader.download(url);
-    } catch (error) {
-      console.error(`Failed to download ${url}:`, error.message);
+    }
+    console.log('\n✓ Download complete!');
+    console.log(`Files saved to: ${path.resolve(options.outputDir)}`);
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      console.error('\n✗ Download cancelled.');
+      process.exitCode = 130;
+    } else {
+      console.error('Download failed:', error.message);
+      process.exitCode = 1;
+    }
+  } finally {
+    process.removeListener('SIGINT', onCancel);
+    process.removeListener('SIGTERM', onCancel);
+    // No sockets should be keeping the event loop alive.
+    if (downloader.activeRequests !== 0) {
+      console.error(`Warning: ${downloader.activeRequests} request(s) still active`);
     }
   }
-
-  console.log('\n✓ Download complete!');
-  console.log(`Files saved to: ${path.resolve(options.outputDir)}`);
 }
 
 if (require.main === module) {
-  main().catch(console.error);
+  main();
 }
 
 module.exports = WebDownloader;
+module.exports.WebDownloader = WebDownloader;
+module.exports.AbortError = AbortError;
